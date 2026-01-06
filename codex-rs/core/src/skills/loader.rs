@@ -231,8 +231,11 @@ fn parse_skill_file(path: &Path, scope: SkillScope) -> Result<SkillMetadata, Ski
 
     let frontmatter = extract_frontmatter(&contents).ok_or(SkillParseError::MissingFrontmatter)?;
 
+    // Normalize the frontmatter to handle unquoted special characters
+    let normalized_frontmatter = normalize_frontmatter_yaml(&frontmatter);
+
     let parsed: SkillFrontmatter =
-        serde_yaml::from_str(&frontmatter).map_err(SkillParseError::InvalidYaml)?;
+        serde_yaml::from_str(&normalized_frontmatter).map_err(SkillParseError::InvalidYaml)?;
 
     let name = sanitize_single_line(&parsed.name);
     let description = sanitize_single_line(&parsed.description);
@@ -306,6 +309,81 @@ fn extract_frontmatter(contents: &str) -> Option<String> {
     }
 
     Some(frontmatter_lines.join("\n"))
+}
+
+/// Normalizes YAML frontmatter by automatically quoting field values that contain
+/// special YAML characters (like colons) which would otherwise cause parsing errors.
+///
+/// This function makes SKILL.md files more user-friendly by handling common cases
+/// where users write descriptions like: "use when prompt: `pattern`" without quotes.
+fn normalize_frontmatter_yaml(yaml: &str) -> String {
+    let mut normalized_lines = Vec::new();
+
+    for line in yaml.lines() {
+        // Skip empty lines and lines that are already using block scalar syntax
+        if line.trim().is_empty() || line.trim_start().starts_with("- ") {
+            normalized_lines.push(line.to_string());
+            continue;
+        }
+
+        // Check if this is a simple key-value line (not nested structures)
+        if let Some(colon_pos) = line.find(':') {
+            let before_colon = &line[..colon_pos];
+            let after_colon = &line[colon_pos + 1..];
+
+            // Only process top-level keys (name, description)
+            // Skip if it's already using block scalar (|-) or if the value is already quoted
+            let trimmed_after = after_colon.trim_start();
+            if trimmed_after.starts_with("|-")
+                || trimmed_after.starts_with("|+")
+                || trimmed_after.starts_with('|')
+                || trimmed_after.starts_with('"')
+                || trimmed_after.starts_with('\'')
+                || before_colon.trim_start() != before_colon.trim_start().trim()
+            {
+                normalized_lines.push(line.to_string());
+                continue;
+            }
+
+            let value = after_colon.trim();
+
+            // Check if value contains YAML special characters that need quoting
+            // Focus on the colon which is the most common issue
+            if !value.is_empty() && needs_quoting(value) {
+                // Escape backslashes first, then double quotes
+                // In YAML double-quoted strings, backslash is an escape character
+                let escaped_value = value.replace('\\', "\\\\").replace('"', "\\\"");
+                normalized_lines.push(format!("{}: \"{}\"", before_colon, escaped_value));
+            } else {
+                normalized_lines.push(line.to_string());
+            }
+        } else {
+            normalized_lines.push(line.to_string());
+        }
+    }
+
+    normalized_lines.join("\n")
+}
+
+/// Checks if a YAML value needs to be quoted to avoid parsing errors.
+/// Returns true if the value contains special YAML characters like colons.
+fn needs_quoting(value: &str) -> bool {
+    // Check for colon followed by space (the most common problematic pattern)
+    // e.g., "use when prompt: `pattern`" where ": `" triggers the error
+    if value.contains(": ") {
+        return true;
+    }
+
+    // Check for other YAML special characters that might cause issues
+    // when they appear in unquoted strings
+    let special_chars = [':', '{', '}', '[', ']', ',', '#'];
+    for ch in special_chars {
+        if value.contains(ch) {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -1042,48 +1120,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_normalize_frontmatter_yaml() {
+        // Test that colons in values are properly handled
+        let input = "name: test-skill\ndescription: Use when prompt: `pattern` appears";
+        let output = normalize_frontmatter_yaml(input);
+        assert!(
+            output.contains("description: \"Use when prompt: `pattern` appears\""),
+            "Expected quoted description, got: {}",
+            output
+        );
+
+        // Test that backslashes and colons are properly escaped
+        let input = "name: test\ndescription: Use when prompt: `\\d+` appears";
+        let output = normalize_frontmatter_yaml(input);
+        assert!(
+            output.contains(r#"description: "Use when prompt: `\\d+` appears""#),
+            "Expected escaped backslashes, got: {}",
+            output
+        );
+
+        // Test that already quoted values are not double-quoted
+        let input = "name: test\ndescription: \"already quoted: value\"";
+        let output = normalize_frontmatter_yaml(input);
+        assert_eq!(input, output, "Already quoted values should not change");
+
+        // Test that block scalar syntax is preserved
+        let input = "name: test\ndescription: |-\n  multiline\n  value: with colon";
+        let output = normalize_frontmatter_yaml(input);
+        assert_eq!(input, output, "Block scalar syntax should be preserved");
+
+        // Test that simple values without special chars are unchanged
+        let input = "name: test-skill\ndescription: A simple description";
+        let output = normalize_frontmatter_yaml(input);
+        assert_eq!(input, output, "Simple values should not change");
+    }
+
     #[tokio::test]
-    async fn rejects_description_with_unquoted_special_yaml_chars() {
-        // Reproduces issue where descriptions containing colons after "prompt: `PLS-\d+`"
-        // cause YAML parsing errors because the colon is interpreted as a key-value separator.
+    async fn accepts_description_with_unquoted_special_yaml_chars() {
+        // Tests that the parser automatically handles descriptions containing colons
+        // like "prompt: `PLS-\d+`" even without explicit quoting.
+        // This is the exact content that used to cause YAML parsing errors before
+        // the automatic normalization was added.
         let codex_home = tempfile::tempdir().expect("tempdir");
         let skill_dir = codex_home.path().join("skills/address-bug");
         fs::create_dir_all(&skill_dir).unwrap();
 
-        // This is the exact content that causes the YAML parsing error reported by users.
-        // The backticks don't protect the colon from YAML's parser.
         let contents = "---\nname: address-bug\ndescription: Addresses technical bugs from an issue tracker. Should be used when the following RegExp is present in a prompt: `PLS-\\d+`.\n---\n\n# Body\n";
-        fs::write(skill_dir.join(SKILLS_FILENAME), contents).unwrap();
+        let skill_path = skill_dir.join(SKILLS_FILENAME);
+        fs::write(&skill_path, contents).unwrap();
 
         let cfg = make_config(&codex_home).await;
         let outcome = load_skills(&cfg);
 
-        // The skill should fail to load due to YAML parsing error
-        assert_eq!(outcome.skills.len(), 0);
-        assert_eq!(outcome.errors.len(), 1);
+        // The skill should now load successfully thanks to automatic normalization
         assert!(
-            outcome.errors[0].message.contains("invalid YAML"),
-            "expected YAML parsing error, got: {:?}",
-            outcome.errors[0].message
+            outcome.errors.is_empty(),
+            "unexpected errors: {:?}",
+            outcome.errors
         );
+        assert_eq!(outcome.skills.len(), 1);
+        assert_eq!(outcome.skills[0].name, "address-bug");
+        // Verify the description was parsed correctly (note: backslash is preserved in parsed value)
         assert!(
-            outcome.errors[0]
-                .message
-                .contains("mapping values are not allowed"),
-            "expected 'mapping values are not allowed' error, got: {:?}",
-            outcome.errors[0].message
+            outcome.skills[0]
+                .description
+                .contains("RegExp is present in a prompt: `PLS-\\d+`"),
+            "Description should contain the pattern, got: {:?}",
+            outcome.skills[0].description
         );
     }
 
     #[tokio::test]
-    async fn accepts_description_with_quoted_special_yaml_chars() {
-        // When the description is properly quoted, special characters like colons are handled correctly
+    async fn accepts_description_with_manually_quoted_yaml() {
+        // Tests that manually quoted descriptions with proper YAML escaping work correctly
         let codex_home = tempfile::tempdir().expect("tempdir");
         let skill_dir = codex_home.path().join("skills/address-bug");
         fs::create_dir_all(&skill_dir).unwrap();
 
-        // Using double quotes to properly escape the description
-        let contents = "---\nname: address-bug\ndescription: \"Addresses technical bugs from an issue tracker. Should be used when the following RegExp is present in a prompt: `PLS-\\d+`.\"\n---\n\n# Body\n";
+        // Using double quotes with proper YAML escaping (backslashes must be doubled)
+        let contents = "---\nname: address-bug\ndescription: \"Addresses technical bugs from an issue tracker. Should be used when the following RegExp is present in a prompt: `PLS-\\\\d+`.\"\n---\n\n# Body\n";
         let skill_path = skill_dir.join(SKILLS_FILENAME);
         fs::write(&skill_path, contents).unwrap();
 
