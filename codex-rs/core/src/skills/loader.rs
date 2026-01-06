@@ -291,14 +291,14 @@ fn extract_frontmatter(contents: &str) -> Option<String> {
         return None;
     }
 
-    let mut frontmatter_lines: Vec<&str> = Vec::new();
+    let mut frontmatter_lines: Vec<String> = Vec::new();
     let mut found_closing = false;
     for line in lines.by_ref() {
         if line.trim() == "---" {
             found_closing = true;
             break;
         }
-        frontmatter_lines.push(line);
+        frontmatter_lines.push(quote_yaml_value_if_needed(line));
     }
 
     if frontmatter_lines.is_empty() || !found_closing {
@@ -306,6 +306,42 @@ fn extract_frontmatter(contents: &str) -> Option<String> {
     }
 
     Some(frontmatter_lines.join("\n"))
+}
+
+/// Quotes YAML string values that contain characters that could cause parsing issues.
+///
+/// In YAML, unquoted strings containing `: ` (colon-space) are interpreted as
+/// nested mappings. This function detects such patterns and wraps the value in
+/// double quotes to ensure it's parsed as a plain string value.
+fn quote_yaml_value_if_needed(line: &str) -> String {
+    // Find the first colon-space pattern which separates key from value
+    let Some(colon_pos) = line.find(": ") else {
+        return line.to_string();
+    };
+
+    let (key_part, value_with_colon) = line.split_at(colon_pos);
+    let value = &value_with_colon[2..]; // Skip ": " prefix
+
+    // If value is already quoted or is empty, no changes needed
+    let trimmed_value = value.trim();
+    if trimmed_value.is_empty()
+        || trimmed_value.starts_with('"')
+        || trimmed_value.starts_with('\'')
+        || trimmed_value.starts_with('|')
+        || trimmed_value.starts_with('>')
+    {
+        return line.to_string();
+    }
+
+    // Check if the value contains problematic patterns that need quoting
+    // `: ` would be interpreted as a nested mapping
+    if value.contains(": ") {
+        // Need to escape existing double quotes in the value and wrap in quotes
+        let escaped_value = trimmed_value.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("{}: \"{}\"", key_part, escaped_value)
+    } else {
+        line.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -991,6 +1027,40 @@ mod tests {
         );
     }
 
+    /// Regression test: descriptions containing colons followed by spaces (e.g. `prompt: \`PLS-\d+\``)
+    /// should not cause YAML parsing errors. This was reported in issue where the YAML parser
+    /// incorrectly interpreted `: ` as a mapping indicator.
+    #[tokio::test]
+    async fn parses_description_containing_colon_space() {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let skill_dir = codex_home.path().join("skills/address-bug");
+        fs::create_dir_all(&skill_dir).unwrap();
+
+        // This is the exact format that was failing - inline description with colon-space pattern
+        let contents = r#"---
+name: address-bug
+description: Addresses technical bugs from an issue tracker. Should be used when the following RegExp is present in a prompt: `PLS-\d+`.
+---
+
+# Body
+"#;
+        let skill_path = skill_dir.join(SKILLS_FILENAME);
+        fs::write(&skill_path, contents).unwrap();
+
+        let cfg = make_config(&codex_home).await;
+        let outcome = load_skills(&cfg);
+
+        // Previously this would fail with: "invalid YAML: mapping values are not allowed in this context"
+        assert!(
+            outcome.errors.is_empty(),
+            "unexpected errors: {:?}",
+            outcome.errors
+        );
+        assert_eq!(outcome.skills.len(), 1);
+        assert_eq!(outcome.skills[0].name, "address-bug");
+        assert!(outcome.skills[0].description.contains("prompt:"));
+    }
+
     #[tokio::test]
     async fn deduplicates_by_name_preferring_nearest_project_codex_dir() {
         let codex_home = tempfile::tempdir().expect("tempdir");
@@ -1039,6 +1109,51 @@ mod tests {
                 scope: SkillScope::Repo,
             }],
             outcome.skills
+        );
+    }
+
+    #[test]
+    fn quote_yaml_value_if_needed_handles_edge_cases() {
+        // No colon-space in value: unchanged
+        assert_eq!(
+            quote_yaml_value_if_needed("name: my-skill"),
+            "name: my-skill"
+        );
+
+        // Colon-space in value: should be quoted
+        assert_eq!(
+            quote_yaml_value_if_needed("description: Use when: foo is bar"),
+            "description: \"Use when: foo is bar\""
+        );
+
+        // Already double-quoted: unchanged
+        assert_eq!(
+            quote_yaml_value_if_needed("description: \"already: quoted\""),
+            "description: \"already: quoted\""
+        );
+
+        // Already single-quoted: unchanged
+        assert_eq!(
+            quote_yaml_value_if_needed("description: 'already: quoted'"),
+            "description: 'already: quoted'"
+        );
+
+        // Multiline block indicator |: unchanged
+        assert_eq!(quote_yaml_value_if_needed("description: |"), "description: |");
+
+        // Multiline block indicator >: unchanged
+        assert_eq!(quote_yaml_value_if_needed("description: >"), "description: >");
+
+        // No colon at all: unchanged
+        assert_eq!(
+            quote_yaml_value_if_needed("  continuation line"),
+            "  continuation line"
+        );
+
+        // Value with existing quotes that need escaping
+        assert_eq!(
+            quote_yaml_value_if_needed("description: Use \"prompt: foo\" here"),
+            "description: \"Use \\\"prompt: foo\\\" here\""
         );
     }
 }
