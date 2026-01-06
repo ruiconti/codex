@@ -1041,4 +1041,97 @@ mod tests {
             outcome.skills
         );
     }
+
+    #[tokio::test]
+    async fn rejects_description_with_unquoted_special_yaml_chars() {
+        // Reproduces issue where descriptions containing colons after "prompt: `PLS-\d+`"
+        // cause YAML parsing errors because the colon is interpreted as a key-value separator.
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let skill_dir = codex_home.path().join("skills/address-bug");
+        fs::create_dir_all(&skill_dir).unwrap();
+
+        // This is the exact content that causes the YAML parsing error reported by users.
+        // The backticks don't protect the colon from YAML's parser.
+        let contents = "---\nname: address-bug\ndescription: Addresses technical bugs from an issue tracker. Should be used when the following RegExp is present in a prompt: `PLS-\\d+`.\n---\n\n# Body\n";
+        fs::write(skill_dir.join(SKILLS_FILENAME), contents).unwrap();
+
+        let cfg = make_config(&codex_home).await;
+        let outcome = load_skills(&cfg);
+
+        // The skill should fail to load due to YAML parsing error
+        assert_eq!(outcome.skills.len(), 0);
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(
+            outcome.errors[0].message.contains("invalid YAML"),
+            "expected YAML parsing error, got: {:?}",
+            outcome.errors[0].message
+        );
+        assert!(
+            outcome.errors[0]
+                .message
+                .contains("mapping values are not allowed"),
+            "expected 'mapping values are not allowed' error, got: {:?}",
+            outcome.errors[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_description_with_quoted_special_yaml_chars() {
+        // When the description is properly quoted, special characters like colons are handled correctly
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let skill_dir = codex_home.path().join("skills/address-bug");
+        fs::create_dir_all(&skill_dir).unwrap();
+
+        // Using double quotes to properly escape the description
+        let contents = "---\nname: address-bug\ndescription: \"Addresses technical bugs from an issue tracker. Should be used when the following RegExp is present in a prompt: `PLS-\\d+`.\"\n---\n\n# Body\n";
+        let skill_path = skill_dir.join(SKILLS_FILENAME);
+        fs::write(&skill_path, contents).unwrap();
+
+        let cfg = make_config(&codex_home).await;
+        let outcome = load_skills(&cfg);
+
+        assert!(
+            outcome.errors.is_empty(),
+            "unexpected errors: {:?}",
+            outcome.errors
+        );
+        assert_eq!(
+            outcome.skills,
+            vec![SkillMetadata {
+                name: "address-bug".to_string(),
+                description: "Addresses technical bugs from an issue tracker. Should be used when the following RegExp is present in a prompt: `PLS-\\d+`.".to_string(),
+                short_description: None,
+                path: normalized(&skill_path),
+                scope: SkillScope::User,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_description_with_block_scalar_yaml() {
+        // Using block scalar syntax (|-) is the recommended approach for complex descriptions
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let skill_dir = codex_home.path().join("skills/address-bug");
+        fs::create_dir_all(&skill_dir).unwrap();
+
+        // Using block scalar syntax which is more robust
+        let contents = "---\nname: address-bug\ndescription: |-\n  Addresses technical bugs from an issue tracker. Should be used when the following\n  RegExp is present in a prompt: `PLS-\\d+`.\n---\n\n# Body\n";
+        let skill_path = skill_dir.join(SKILLS_FILENAME);
+        fs::write(&skill_path, contents).unwrap();
+
+        let cfg = make_config(&codex_home).await;
+        let outcome = load_skills(&cfg);
+
+        assert!(
+            outcome.errors.is_empty(),
+            "unexpected errors: {:?}",
+            outcome.errors
+        );
+        assert_eq!(outcome.skills.len(), 1);
+        assert_eq!(outcome.skills[0].name, "address-bug");
+        // The description should be sanitized (single line with whitespace normalized)
+        assert!(outcome.skills[0]
+            .description
+            .contains("RegExp is present in a prompt: `PLS-\\d+`."));
+    }
 }
